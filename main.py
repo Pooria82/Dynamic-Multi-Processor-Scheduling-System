@@ -43,6 +43,8 @@ class MainController(threading.Thread):
         self.process_generator = process_generator
         self.running = True
         self.thread_id = None
+        self.start_time = time.time()
+        self.run_duration = self.process_generator.duration
         
     def run(self):
         self.thread_id = threading.get_ident()
@@ -54,7 +56,13 @@ class MainController(threading.Thread):
                 cpu.start()
                 
             while self.running:
+                current_time = time.time() - self.start_time
+                if current_time >= self.run_duration:
+                    print("Runtime expired, stopping system...")
+                    self.stop()
+                    break
                 time.sleep(0.1)
+                
         except Exception as e:
             print(f"Controller error: {e}")
             self.stop()
@@ -89,57 +97,89 @@ class Process:
 
 
 class ProcessGenerator(threading.Thread):
-    def __init__(self, input_queue, input_lock, count=50, duration=30):
+    def __init__(self, incoming_queue, incoming_lock, count=50, duration=30):
         super().__init__()
-        self.input_queue = input_queue
-        self.input_lock = input_lock
+        self.incoming_queue = incoming_queue
+        self.incoming_lock = incoming_lock
         self.running = True
         self.count = count
         self.duration = duration
         self.start_time = time.time()
         self.generated = 0
+        # Add rate control
+        self.generation_interval = duration / count if count > 0 else 0.1
 
     def run(self):
-        while self.running and self.generated < self.count and (time.time() - self.start_time) < self.duration:
+        while self.running and self.generated < self.count:
             current_time = time.time() - self.start_time
-            exec_time = random.uniform(0.5, 3.0)
-            start_dl = random.uniform(1.0, 5.0)
-            end_dl = start_dl + exec_time + random.uniform(1.0, 2.0)
+            if current_time >= self.duration:
+                break
+                
+            exec_time = random.uniform(0.5, 2.0)  # Reduced max exec time
+            start_dl = random.uniform(0.5, 3.0)   # Reduced deadline range
+            end_dl = start_dl + exec_time + random.uniform(0.5, 1.0)
             value = random.uniform(0.0, 1.0)
+            
             proc = Process(current_time, exec_time, start_dl, end_dl, value)
-            with self.input_lock:
-                self.input_queue.append(proc)
+            with self.incoming_lock:
+                self.incoming_queue.append(proc)
             self.generated += 1
-            time.sleep(random.uniform(0.05, 0.2))
+            
+            # Sleep for generation interval
+            time.sleep(self.generation_interval)
 
     def stop(self):
         self.running = False
 
 def reorder_queue(algo, queue):
     """
-    Reorders the queue in-place according to the chosen scheduling algorithm.
-    Available: RR, weightedRR, SRTF, FCFS, RateMonotonic
+    Implements scheduling algorithms:
+    - RR: Round Robin with time slices
+    - WeightedRR: Weighted Round Robin based on process value
+    - SRTF: Shortest Remaining Time First
+    - FCFS: First Come First Served
+    - RateMonotonic: Priority based on period/deadline
     """
-    # Note: For RR/weightedRR we won't fully simulate time slices here,
-    # but we can do a partial sort or rotation approach as a placeholder.
-    if algo.upper() == "FCFS":
-        # Same as FIFO: sort by arrival time
-        queue.sort(key=lambda p: p.arrival_time)
+    if not queue:
+        return
+
+    if algo.upper() == "RR":
+        # Round Robin - Rotate queue to give each process fair time slice
+        if len(queue) > 1:
+            queue.append(queue.pop(0))
+
+    elif algo.upper() == "WEIGHTEDRR":
+        # Weighted Round Robin - Higher value processes get more CPU time
+        # Sort by value and remaining time as secondary factor
+        queue.sort(key=lambda p: (-p.value, p.remaining_time))
+        
+        # Calculate time quantum based on process value
+        for proc in queue:
+            proc.time_quantum = 0.1 * (1 + proc.value)  # 0.1-0.2s based on value
+
     elif algo.upper() == "SRTF":
         # Shortest Remaining Time First
-        queue.sort(key=lambda p: p.remaining_time)
+        queue.sort(key=lambda p: (
+            p.remaining_time,  # Primary: shortest remaining time
+            p.end_deadline,    # Secondary: earliest deadline
+            -p.value          # Tertiary: highest value
+        ))
+
+    elif algo.upper() == "FCFS":
+        # First Come First Served - Sort by arrival time
+        queue.sort(key=lambda p: (
+            p.arrival_time,    # Primary: arrival time
+            p.end_deadline,    # Secondary: deadline
+            -p.value          # Tertiary: value
+        ))
+
     elif algo.upper() == "RATEMONOTONIC":
-        # Interpreting rate monotonic as "shorter deadline => higher priority"
-        queue.sort(key=lambda p: p.start_deadline)
-    elif algo.upper() == "RR":
-        # Round Robin (placeholder): leave the queue in its current order
-        pass
-    elif algo.upper() == "WEIGHTEDRR":
-        # Weighted round robin (placeholder): sort by value descending
-        queue.sort(key=lambda p: -p.value)
-    else:
-        # Default is FCFS if unknown
-        queue.sort(key=lambda p: p.arrival_time)
+        # Rate Monotonic - Higher priority to shorter deadlines
+        queue.sort(key=lambda p: (
+            p.end_deadline - p.arrival_time,  # Primary: period/deadline
+            p.remaining_time,                 # Secondary: remaining time
+            -p.value                         # Tertiary: value
+        ))
 
 class Scheduler(threading.Thread):
     """
@@ -147,11 +187,11 @@ class Scheduler(threading.Thread):
     Each layer can use a chosen algorithm: RR, weightedRR, SRTF, FCFS, RateMonotonic.
     The ready_queue capacity is limited to 20.
     """
-    def __init__(self, input_queue, input_lock, ready_queue, ready_lock, expired_count,
-                 layers=1, algorithms=("FCFS",)):
+    def __init__(self, incoming_queue, incoming_lock, ready_queue, ready_lock, 
+                 expired_count, layers=1, algorithms=("FCFS",)):
         super().__init__()
-        self.input_queue = input_queue
-        self.input_lock = input_lock
+        self.incoming_queue = incoming_queue
+        self.incoming_lock = incoming_lock
         self.ready_queue = ready_queue
         self.ready_lock = ready_lock
         self.expired_count = expired_count
@@ -169,40 +209,38 @@ class Scheduler(threading.Thread):
             to_ready = []
             to_remove = []
             
-            with self.input_lock:
-                for proc in self.input_queue:
-                    if (now - proc.arrival_time) > proc.start_deadline:
-                        to_remove.append(proc)
-                    elif (now - proc.arrival_time) > proc.end_deadline:
+            # Get processes from incoming queue
+            with self.incoming_lock:
+                while self.incoming_queue:
+                    proc = self.incoming_queue.popleft()
+                    if (now - proc.arrival_time) > proc.end_deadline:
                         to_remove.append(proc)
                     else:
-                        # Calculate heuristic score
                         proc.score = calculate_heuristic_score(proc, now)
                         if proc.score > 0:
                             to_ready.append(proc)
                         else:
                             to_remove.append(proc)
-
-                for proc in to_remove:
-                    if proc in self.input_queue:
-                        self.input_queue.remove(proc)
-                        with self.expired_count['lock']:
-                            self.expired_count['value'] += 1
                             
-                self.input_queue.clear()
+            # Update expired count
+            for proc in to_remove:
+                with self.expired_count['lock']:
+                    self.expired_count['value'] += 1
 
+            # Update ready queue with mutex lock
             with self.ready_lock:
+                # Merge existing and new processes
                 combined = list(self.ready_queue) + to_ready
                 self.ready_queue.clear()
-
+                
                 # Apply scheduling layers
                 for algo in self.algorithms:
                     reorder_queue(algo, combined)
-
-                # Final sort by heuristic score
+                    
+                # Final sort by score
                 combined.sort(key=lambda x: (-x.score, x.end_deadline))
                 
-                # Keep top 20
+                # Keep top 20 processes
                 self.ready_queue.extend(combined[:20])
 
     def stop(self):
@@ -227,16 +265,19 @@ class CPU(threading.Thread):
     def run(self):
         while self.running:
             self.thread_id = threading.get_ident()
+            
+            # Get next process with proper locking
             with self.ready_lock:
                 if not self.current_proc and self.ready_queue:
                     self.current_proc = self.ready_queue.pop(0)
-
+                    
             if self.current_proc:
                 self.cpu_stats[self.cpu_id]["proc_id"] = self.current_proc.pid
                 self.cpu_stats[self.cpu_id]["proc_val"] = self.current_proc.value
 
                 now_global = time.time() - self.start_time
-                # Check end-deadline
+
+                # Check deadline
                 if (now_global - self.current_proc.arrival_time) > self.current_proc.end_deadline:
                     self._expire_current()
                     continue
@@ -244,35 +285,58 @@ class CPU(threading.Thread):
                 if self.current_proc.start_exec_time is None:
                     self.current_proc.start_exec_time = now_global
 
-                # Time slice
-                time_slice = min(0.05, self.current_proc.remaining_time)
+                # Get time slice based on algorithm
+                if hasattr(self.current_proc, 'time_quantum'):
+                    # For Weighted RR
+                    time_slice = min(self.current_proc.time_quantum, 
+                                   self.current_proc.remaining_time)
+                else:
+                    # Default time slice
+                    time_slice = min(0.05, self.current_proc.remaining_time)
+
+                # Execute time slice
                 time.sleep(time_slice)
                 self.current_proc.remaining_time -= time_slice
                 now_global = time.time() - self.start_time
                 self.current_proc.finish_exec_time = now_global
 
                 if self.current_proc.remaining_time <= 0:
-                    # Check deadline upon finish
+                    # Process completed
                     if (now_global - self.current_proc.arrival_time) > self.current_proc.end_deadline:
                         self._expire_current()
                     else:
                         self._complete_current()
                 else:
-                    # Preempt if there's a higher-value process
+                    # Process needs more time
                     with self.ready_lock:
-                        higher_in_queue = any(p.value > self.current_proc.value for p in self.ready_queue)
-                        if higher_in_queue:
-                            self.ready_queue.append(self.current_proc)
-                            # Sort by value descending as a fallback
-                            self.ready_queue.sort(key=lambda x: (-x.value, x.end_deadline))
-                            self.current_proc = None
-                            self.cpu_stats[self.cpu_id]["proc_id"] = None
-                            self.cpu_stats[self.cpu_id]["proc_val"] = 0.0
+                        # For preemptive algorithms, check if should preempt
+                        if self.ready_queue:
+                            should_preempt = False
+                            next_proc = self.ready_queue[0]
+                            
+                            if next_proc.remaining_time < self.current_proc.remaining_time:
+                                # SRTF preemption
+                                should_preempt = True
+                            elif next_proc.value > self.current_proc.value:
+                                # Value-based preemption
+                                should_preempt = True
+                                
+                            if should_preempt:
+                                self.ready_queue.append(self.current_proc)
+                                self.current_proc = None
+                                self.cpu_stats[self.cpu_id]["proc_id"] = None
+                                self.cpu_stats[self.cpu_id]["proc_val"] = 0.0
+                            else:
+                                # For RR, move to back of queue
+                                self.ready_queue.append(self.current_proc)
+                                self.current_proc = None
+                                self.cpu_stats[self.cpu_id]["proc_id"] = None
+                                self.cpu_stats[self.cpu_id]["proc_val"] = 0.0
+
             else:
-                self.cpu_stats[self.cpu_id]["proc_id"] = None
+                self.cpu_stats[self.cpu_id]["proc_id"] = None  
                 self.cpu_stats[self.cpu_id]["proc_val"] = 0.0
                 time.sleep(0.01)
-
     def _expire_current(self):
         with self.expired_count['lock']:
             self.expired_count['value'] += 1
@@ -296,6 +360,8 @@ class CPU(threading.Thread):
 
 
 def main():
+
+    failed_tasks = {'value': 0, 'lock': threading.Lock()}
     # Default settings
     default_num_cpus = 2
     default_count = 50
@@ -303,6 +369,11 @@ def main():
     default_layers = 1
     # Provide the user with the new algorithms
     layer_algos = ("RR", "weightedRR", "SRTF", "FCFS", "RateMonotonic")
+
+    incoming_queue = deque()
+    incoming_lock = threading.Lock() 
+    ready_queue = []
+    ready_lock = threading.Lock()
 
     input_queue = deque()
     input_lock = threading.Lock()
@@ -322,9 +393,6 @@ def main():
     time_history = []
     start_time = None
 
-    ###########################################################################
-    # Tkinter GUI
-    ###########################################################################
     root = tk.Tk()
     root.title("CPU Usage - Multi-Layer Scheduling")
 
@@ -347,10 +415,28 @@ def main():
     time_entry.insert(tk.END, str(default_run_duration))
     time_entry.pack(side=tk.LEFT)
 
-    tk.Label(top_frame, text="Layers(1-3):").pack(side=tk.LEFT, padx=5)
-    layers_entry = tk.Entry(top_frame, width=5)
-    layers_entry.insert(tk.END, str(default_layers))
-    layers_entry.pack(side=tk.LEFT)
+    layer_control_frame = tk.Frame(top_frame)
+    layer_control_frame.pack(side=tk.LEFT, padx=5)
+    
+    tk.Label(layer_control_frame, text="Layers:").pack(side=tk.LEFT)
+    layer_value = tk.IntVar(value=default_layers)
+    layer_label = tk.Label(layer_control_frame, textvariable=layer_value)
+    layer_label.pack(side=tk.LEFT, padx=5)
+    
+    def increment_layers():
+        current = layer_value.get()
+        if current < 3:
+            layer_value.set(current + 1)
+            update_layer_controls()
+            
+    def decrement_layers():
+        current = layer_value.get()
+        if current > 1:
+            layer_value.set(current - 1)
+            update_layer_controls()
+    
+    tk.Button(layer_control_frame, text="-", command=decrement_layers).pack(side=tk.LEFT)
+    tk.Button(layer_control_frame, text="+", command=increment_layers).pack(side=tk.LEFT)
 
     # Scheduling algo selectors for each layer
     layer_frame = tk.Frame(top_frame)
@@ -361,18 +447,7 @@ def main():
         for widget in layer_frame.winfo_children():
             widget.destroy()
             
-        try:
-            num_layers = int(layers_entry.get())
-            # Constrain to 1-3 layers
-            num_layers = max(1, min(3, num_layers))
-            layers_entry.delete(0, tk.END)
-            layers_entry.insert(0, str(num_layers))
-        except ValueError:
-            # Reset to default if invalid
-            layers_entry.delete(0, tk.END)
-            layers_entry.insert(0, str(default_layers))
-            num_layers = default_layers
-            
+        num_layers = layer_value.get()
         algo_vars.clear()
         
         for i in range(num_layers):
@@ -382,7 +457,6 @@ def main():
             algo_vars.append(var)
             tk.OptionMenu(layer_frame, var, *layer_algos).pack(side=tk.LEFT, padx=5)
             
-    layers_entry.bind('<KeyRelease>', update_layer_controls)
     update_layer_controls() # Initial setup
 
     # Start/Stop buttons
@@ -419,6 +493,7 @@ def main():
         thread_info.insert(tk.END, f"\nTotal Score: {total_score['value']:.2f}\n")
         thread_info.insert(tk.END, f"Processes Done: {len(executed_processes['list'])}\n")  
         thread_info.insert(tk.END, f"Missed Deadlines: {expired_count['value']}\n")
+        thread_info.insert(tk.END, f"Failed Tasks: {failed_tasks['value']}\n")
         
         if thread_info.running:
             root.after(500, update_report)
@@ -435,7 +510,7 @@ def main():
             num_cpus = int(cpu_entry.get())
             count = int(proc_entry.get())
             run_duration = float(time_entry.get())
-            layers = int(layers_entry.get())
+            layers = layer_value.get()
             chosen_algos = [algo_vars[i].get() for i in range(layers)]
 
             # Clear stats
@@ -457,11 +532,12 @@ def main():
             total_score['value'] = 0.0
 
             # Create new threads
-            process_generator = ProcessGenerator(input_queue, input_lock, count=count, duration=run_duration)
-            scheduler = Scheduler(
-                input_queue, input_lock, ready_queue, ready_lock,
-                expired_count, layers=layers, algorithms=chosen_algos
-            )
+            process_generator = ProcessGenerator(incoming_queue, incoming_lock, 
+                                            count=count, duration=run_duration)
+            scheduler = Scheduler(incoming_queue, incoming_lock,
+                                ready_queue, ready_lock,
+                                expired_count, layers=layers, 
+                                algorithms=chosen_algos)
             cpus = []
             for i in range(num_cpus):
                 cpu_thread = CPU(
@@ -491,19 +567,40 @@ def main():
 
     def stop_system():
         thread_info.running = False
-        if 'controller' in globals():
-            controller.stop()
-            controller.join()
-        if process_generator:
-            process_generator.stop()
-            process_generator.join()
-        if scheduler:
-            scheduler.stop()
-            scheduler.join()
-        for c in cpus:
-            c.stop()
-        for c in cpus:
-            c.join()
+        try:
+            # Count remaining tasks before stopping threads
+            with ready_lock:
+                remaining = len(ready_queue)
+            with incoming_lock:
+                remaining += len(incoming_queue)
+            with failed_tasks['lock']:
+                failed_tasks['value'] = remaining
+
+            # Stop threads
+            if 'controller' in globals():
+                controller.stop()
+                controller.join(timeout=1.0)
+                
+            # Stop other threads
+            if process_generator:
+                process_generator.stop()
+                process_generator.join(timeout=1.0)
+            if scheduler:
+                scheduler.stop()
+                scheduler.join(timeout=1.0)
+            for c in cpus:
+                c.stop()
+                c.join(timeout=1.0)
+
+        except Exception as e:
+            print(f"Error stopping system: {e}")
+        finally:
+            # Force reset states
+            if 'controller' in globals():
+                del controller
+            process_generator = None
+            scheduler = None
+            cpus.clear()
 
     def update_plots(run_duration):
         now = time.time() - start_time
@@ -563,6 +660,8 @@ def main():
             print(f"Total Processes Generated: {total_generated}")
             print(f"Successfully Executed: {len(final_list)}")
             print(f"Missed Deadlines: {total_expired}")
+            print(f"Failed Tasks: {failed_tasks['value']}")
+            print(f"Total Tasks: {total_generated}")
             print(f"Hit Rate: {hit_rate:.2f}")
             print(f"Total Score: {final_score:.2f}")
             print(f"Average Waiting Time: {avg_waiting:.2f}")
