@@ -12,6 +12,79 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 LOG_FILE = Path(__file__).parent / "scheduling_results.log"
+PROCESS_LOG_FILE = Path(__file__).parent / "process_history.log"
+failed_tasks = {'value': 0, 'lock': threading.Lock()}
+
+def show_history_logs():
+    """Show process execution history in new window with simple syntax highlighting."""
+    log_window = tk.Toplevel()
+    log_window.title("Process Execution History")
+    log_window.geometry("800x600")
+
+    text_widget = tk.Text(log_window, wrap=tk.NONE)
+    text_widget.pack(expand=True, fill=tk.BOTH)
+
+    y_scroll = tk.Scrollbar(log_window, orient=tk.VERTICAL, command=text_widget.yview)
+    y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    x_scroll = tk.Scrollbar(log_window, orient=tk.HORIZONTAL, command=text_widget.xview)
+    x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+    text_widget.config(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+
+    # Define color tags for highlighting
+    text_widget.tag_config('timestamp', foreground='green')
+    text_widget.tag_config('process_id', foreground='yellow')
+    text_widget.tag_config('completed_event', foreground='green')
+    text_widget.tag_config('expired_event', foreground='red')
+    text_widget.tag_config('header', foreground='cyan', underline=1)
+
+    try:
+        with open(PROCESS_LOG_FILE, 'r') as f:
+            lines = f.readlines()
+            # Insert CSV header as cyan, underlined
+            header_line = "Timestamp,ProcessID,Event,CPU,ArrivalTime,ExecTime,StartTime,EndTime\n"
+            text_widget.insert(tk.END, header_line, 'header')
+
+            for line in lines:
+                line_str = line.strip()
+                # Skip the original CSV header or any empty lines
+                if not line_str or line_str.startswith("Timestamp,ProcessID,Event"):
+                    continue
+
+                parts = line_str.split(',')
+                if len(parts) < 8:
+                    text_widget.insert(tk.END, line + "\n")
+                    continue
+
+                timestamp_str = parts[0]
+                pid_str = parts[1]
+                event_str = parts[2]
+                cpu_str = parts[3]
+                arrival_str = parts[4]
+                exec_str = parts[5]
+                start_str = parts[6]
+                end_str = parts[7]
+
+                # Insert timestamp in green
+                text_widget.insert(tk.END, f"{timestamp_str} ", 'timestamp')
+                # Insert process ID in yellow
+                text_widget.insert(tk.END, f"{pid_str} ", 'process_id')
+
+                # Highlight events
+                if "COMPLETED" in event_str:
+                    text_widget.insert(tk.END, event_str, 'completed_event')
+                elif "EXPIRED" in event_str:
+                    text_widget.insert(tk.END, event_str, 'expired_event')
+                else:
+                    text_widget.insert(tk.END, event_str)
+
+                info_line = f", {cpu_str}, {arrival_str}, {exec_str}, {start_str}, {end_str}\n"
+                text_widget.insert(tk.END, info_line)
+
+    except Exception as e:
+        text_widget.insert(tk.END, f"Error reading log: {e}")
+
+    text_widget.config(state=tk.DISABLED)
 
 def log_final_results(system_state, executed_list, stats):
     """Log final results to file"""
@@ -41,21 +114,19 @@ def log_final_results(system_state, executed_list, stats):
         print(f"Error logging results: {e}")
 
 def write_run_results(config, results):
-    """Write run results to log file"""
+    """Write run results to log file and print full results to console."""
     try:
-        # Create log header
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         header = f"\n{'='*50}\n"
         header += f"Run Date: {timestamp}\n"
-        header += f"Configuration:\n"
+        header += "Configuration:\n"
         header += f"- CPUs: {config['cpus']}\n"
         header += f"- Processes: {config['processes']}\n"
         header += f"- Duration: {config['duration']}s\n"
         header += f"- Scheduling Layers: {config['layers']}\n"
         header += f"- Algorithms: {', '.join(config['algorithms'])}\n"
-        
-        # Format results
-        results_text = f"\nResults:\n"
+
+        results_text = "\nResults:\n"
         results_text += f"- Total Processes: {results['total_generated']}\n"
         results_text += f"- Successfully Executed: {results['completed']}\n"
         results_text += f"- Missed Deadlines: {results['expired']}\n"
@@ -64,12 +135,12 @@ def write_run_results(config, results):
         results_text += f"- Total Score: {results['score']:.2f}\n"
         results_text += f"- Avg Waiting Time: {results['avg_waiting']:.2f}s\n"
         results_text += f"- Avg Response Time: {results['avg_response']:.2f}s\n"
-        
-        # Write to file
+
         with open(LOG_FILE, 'a') as f:
-            f.write(header)
-            f.write(results_text)
-            
+            f.write(header + results_text)
+
+        print(header + results_text)
+
     except Exception as e:
         print(f"Error writing to log file: {e}")
 
@@ -97,6 +168,20 @@ def calculate_heuristic_score(process, current_time):
              
     return score
 
+def log_process_execution(process, cpu_id, event_type):
+    """Log process execution events"""
+    try:
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        start_time_str = f"{process.start_exec_time:.2f}" if process.start_exec_time is not None else "NA"
+        finish_time_str = f"{process.finish_exec_time:.2f}" if process.finish_exec_time is not None else "NA"
+        with open(PROCESS_LOG_FILE, 'a') as f:
+            f.write(
+                f"{timestamp},{process.pid},{event_type},CPU{cpu_id},"
+                f"{process.arrival_time:.2f},{process.exec_time:.2f},"
+                f"{start_time_str},{finish_time_str}\n"
+            )
+    except Exception as e:
+        print(f"Error logging process: {e}")
 
 class MainController(threading.Thread):
     def __init__(self, cpus, scheduler, process_generator):
@@ -205,39 +290,36 @@ def reorder_queue(algo, queue):
     """
     if not queue:
         return []
-        
-    result = queue.copy()  # Work on a copy
+
+    # Copy to avoid in-place conflicts
+    result = queue.copy()
 
     if algo.upper() == "RR":
+        # Basic round-robin: rotate the queue
         if len(result) > 1:
             result.append(result.pop(0))
-            
+
     elif algo.upper() == "WEIGHTEDRR":
+        # Sort by highest value first, then rotate
         result.sort(key=lambda p: (-p.value, p.remaining_time))
+        # Assign time_quantum based on value
         for proc in result:
             proc.time_quantum = 0.1 * (1 + proc.value)
-            
+        if len(result) > 1:
+            result.append(result.pop(0))
+
     elif algo.upper() == "SRTF":
-        result.sort(key=lambda p: (
-            p.remaining_time,
-            p.end_deadline,
-            -p.value
-        ))
-        
+        # Shortest remaining time first
+        result.sort(key=lambda p: (p.remaining_time, p.end_deadline, -p.value))
+
     elif algo.upper() == "FCFS":
-        result.sort(key=lambda p: (
-            p.arrival_time,
-            p.end_deadline,
-            -p.value
-        ))
-        
+        # First come, first served
+        result.sort(key=lambda p: (p.arrival_time, p.end_deadline, -p.value))
+
     elif algo.upper() == "RATEMONOTONIC":
-        result.sort(key=lambda p: (
-            p.end_deadline - p.arrival_time,
-            p.remaining_time,
-            -p.value
-        ))
-        
+        # Sort by earliest (deadline - arrival), then shortest remaining
+        result.sort(key=lambda p: (p.end_deadline - p.arrival_time, p.remaining_time, -p.value))
+
     return result
 
 class Scheduler(threading.Thread):
@@ -259,6 +341,7 @@ class Scheduler(threading.Thread):
         self.layers = layers
         self.algorithms = algorithms
         self.thread_id = None 
+        self.layer_ratios = [1.0, 0.6, 0.4]
 
     def run(self):
         self.thread_id = threading.get_ident()
@@ -267,8 +350,8 @@ class Scheduler(threading.Thread):
             now = time.time() - self.start_time
             to_ready = []
             to_remove = []
-            
-            # Get processes from incoming queue
+
+            # Safely move processes from incoming_queue
             with self.incoming_lock:
                 while self.incoming_queue:
                     proc = self.incoming_queue.popleft()
@@ -280,27 +363,25 @@ class Scheduler(threading.Thread):
                             to_ready.append(proc)
                         else:
                             to_remove.append(proc)
-                            
-            # Update expired count
-            for proc in to_remove:
-                with self.expired_count['lock']:
-                    self.expired_count['value'] += 1
 
-            # Update ready queue with mutex lock
+            with self.expired_count['lock']:
+                self.expired_count['value'] += len(to_remove)
+
+            # Lock ready_queue before reordering
             with self.ready_lock:
-                # Start with combined processes
                 result_queue = list(self.ready_queue) + to_ready
-                
-                # Apply each layer's algorithm in sequence
-                for algo in self.algorithms:
-                    result_queue = reorder_queue(algo, result_queue)
-                    
-                # Final sort by score
+
+                # Apply multi-layer algorithms
+                for layer, algo in enumerate(self.algorithms):
+                    layer_size = int(len(result_queue) * self.layer_ratios[layer])
+                    layer_processes = result_queue[:layer_size]
+                    layer_result = reorder_queue(algo, layer_processes)
+                    result_queue = layer_result + result_queue[layer_size:]
+
+                # Final sort by score, ensure top 20
                 result_queue.sort(key=lambda x: (-x.score, x.end_deadline))
-                
-                # Update ready queue with results
                 self.ready_queue.clear()
-                self.ready_queue.extend(result_queue[:20])  # Keep top 20
+                self.ready_queue.extend(result_queue[:20])
 
     def stop(self):
         self.running = False
@@ -355,6 +436,8 @@ class CPU(threading.Thread):
 
                 # Execute time slice
                 time.sleep(time_slice)
+                if not self.current_proc:
+                    continue
                 self.current_proc.remaining_time -= time_slice
                 now_global = time.time() - self.start_time
                 self.current_proc.finish_exec_time = now_global
@@ -397,6 +480,7 @@ class CPU(threading.Thread):
                 self.cpu_stats[self.cpu_id]["proc_val"] = 0.0
                 time.sleep(0.01)
     def _expire_current(self):
+        log_process_execution(self.current_proc, self.cpu_id, "EXPIRED")
         with self.expired_count['lock']:
             self.expired_count['value'] += 1
         self.cpu_stats[self.cpu_id]["proc_id"] = None
@@ -405,6 +489,7 @@ class CPU(threading.Thread):
         time.sleep(0.01)
 
     def _complete_current(self):
+        log_process_execution(self.current_proc, self.cpu_id, "COMPLETED")
         with self.executed_processes['lock']:
             self.executed_processes['list'].append(self.current_proc)
         with self.total_score['lock']:
@@ -416,6 +501,12 @@ class CPU(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self.current_proc is not None:
+            log_process_execution(self.current_proc, self.cpu_id, "FAILED")
+            # Increment the global failed_tasks counter for the process in progress
+            with failed_tasks['lock']:
+                failed_tasks['value'] += 1
+            self.current_proc = None
 
 
 def main():
@@ -506,6 +597,8 @@ def main():
     tk.Button(layer_control_frame, text="-", command=decrement_layers).pack(side=tk.LEFT)
     tk.Button(layer_control_frame, text="+", command=increment_layers).pack(side=tk.LEFT)
 
+    
+
     # Scheduling algo selectors for each layer
     layer_frame = tk.Frame(top_frame)
     layer_frame.pack(side=tk.LEFT)
@@ -530,6 +623,9 @@ def main():
     # Start/Stop buttons
     btn_frame = tk.Frame(root)
     btn_frame.pack(side=tk.TOP, fill=tk.X, pady=5)
+
+    history_button = tk.Button(btn_frame, text="Show History Logs", command=show_history_logs)
+    history_button.pack(side=tk.LEFT, padx=10)
 
     fig = plt.Figure(figsize=(8, 6), dpi=100)
     ax_bar = fig.add_subplot(211)
@@ -558,10 +654,13 @@ def main():
                 cpu_id = getattr(cpu, 'thread_id', 'Not started')
                 thread_info.insert(tk.END, f"CPU {cpu.cpu_id}: {cpu_id}\n")
         
+        total_processes = len(executed_processes['list']) + expired_count['value'] + failed_tasks['value']
+        
         thread_info.insert(tk.END, f"\nTotal Score: {total_score['value']:.2f}\n")
-        thread_info.insert(tk.END, f"Processes Done: {len(executed_processes['list'])}\n")  
+        thread_info.insert(tk.END, f"Total Processes: {total_processes}\n")
+        thread_info.insert(tk.END, f"Completed: {len(executed_processes['list'])}\n")  
         thread_info.insert(tk.END, f"Missed Deadlines: {expired_count['value']}\n")
-        thread_info.insert(tk.END, f"Failed Tasks: {failed_tasks['value']}\n")
+        thread_info.insert(tk.END, f"Failed/Unfinished: {failed_tasks['value']}\n")
         
         if thread_info.running:
             root.after(500, update_report)
@@ -572,6 +671,11 @@ def main():
         global controller
 
         try:
+            # Overwrite process history file at the start of each run
+            with open(PROCESS_LOG_FILE, 'w') as f:
+                # Initialize with the CSV header
+                f.write("Timestamp,ProcessID,Event,CPU,ArrivalTime,ExecTime,StartTime,EndTime\n")
+
             # Stop any running system
             stop_system()
 
@@ -596,9 +700,9 @@ def main():
                 cpu_stats[i] = {"proc_id": None, "proc_val": 0.0}
                 usage_history[i] = []
             
-            time_history.append(0.0)  # Initialize with 0
+            time_history.append(0.0)
             for i in range(num_cpus):
-                usage_history[i].append(0.0)  # Initialize with 0
+                usage_history[i].append(0.0)
 
             # Reset data structures
             with input_lock:
@@ -638,7 +742,6 @@ def main():
             )
             system_state['controller'].start()
             
-            # Start UI updates
             system_state['running'] = True
             thread_info.running = True
             update_report()
@@ -654,9 +757,19 @@ def main():
         try:
             # Count remaining tasks before stopping threads
             with ready_lock:
+                # Log remaining tasks in ready_queue as FAILED
+                for p in ready_queue:
+                    log_process_execution(p, -1, "FAILED")
                 remaining = len(ready_queue)
+                ready_queue.clear()
+
             with incoming_lock:
+                # Log remaining tasks in incoming_queue as FAILED
+                for p in incoming_queue:
+                    log_process_execution(p, -1, "FAILED")
                 remaining += len(incoming_queue)
+                incoming_queue.clear()
+
             with failed_tasks['lock']:
                 failed_tasks['value'] = remaining
 
@@ -664,15 +777,12 @@ def main():
             if system_state['controller']:
                 system_state['controller'].stop()
                 system_state['controller'].join(timeout=1.0)
-                
             if system_state['process_generator']:
                 system_state['process_generator'].stop()
                 system_state['process_generator'].join(timeout=1.0)
-                
             if system_state['scheduler']:
                 system_state['scheduler'].stop() 
                 system_state['scheduler'].join(timeout=1.0)
-                
             for cpu in system_state['cpus']:
                 cpu.stop()
                 cpu.join(timeout=1.0)
@@ -680,7 +790,6 @@ def main():
         except Exception as e:
             print(f"Error stopping system: {e}")
         finally:
-            # Reset system state
             system_state['controller'] = None
             system_state['process_generator'] = None
             system_state['scheduler'] = None
@@ -726,19 +835,21 @@ def main():
         if now < run_duration and system_state['running']:
             root.after(100, lambda: update_plots(run_duration))
         else:
-            # Collect final stats before stopping
+            # Collect final stats
             final_list = executed_processes['list']
-            total_generated = system_state['process_generator'].generated if system_state['process_generator'] else 0
-            total_expired = expired_count['value'] 
+            total_generated = (
+                system_state['process_generator'].generated
+                if system_state['process_generator'] else 0
+            )
+            total_expired = expired_count['value']
             final_score = total_score['value']
 
-            # Calculate statistics
             waiting_times = []
             response_times = []
             for p in final_list:
-                if p.start_exec_time and p.arrival_time:
+                if p.start_exec_time is not None:
                     waiting_times.append(p.start_exec_time - p.arrival_time)
-                if p.finish_exec_time and p.arrival_time:    
+                if p.finish_exec_time is not None:
                     response_times.append(p.finish_exec_time - p.arrival_time)
 
             stats = {
@@ -749,15 +860,22 @@ def main():
                 'layers': layer_value.get(),
                 'algorithms': [v.get() for v in algo_vars],
                 'total_score': final_score,
-                'hit_rate': len(final_list) / float(total_generated) if total_generated else 0.0,
-                'avg_waiting': sum(waiting_times) / len(waiting_times) if waiting_times else 0.0,
-                'avg_response': sum(response_times) / len(response_times) if response_times else 0.0
+                'hit_rate': (
+                    len(final_list) / float(total_generated)
+                    if total_generated else 0.0
+                ),
+                'avg_waiting': (
+                    sum(waiting_times)/len(waiting_times)
+                    if waiting_times else 0.0
+                ),
+                'avg_response': (
+                    sum(response_times)/len(response_times)
+                    if response_times else 0.0
+                )
             }
 
-            # Log results
             log_final_results(system_state, final_list, stats)
-            
-            # Stop system
+
             stop_system()
 
     start_button = tk.Button(btn_frame, text="Start", command=start_system)
